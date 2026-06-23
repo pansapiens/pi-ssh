@@ -14,7 +14,7 @@ import {
 
 interface SshConnection {
   remote: string;
-  port: number;
+  port?: number;
   remoteCwd: string;
   remoteHome: string;
   localCwd: string;
@@ -160,8 +160,12 @@ function parseSshFlag(raw: string): { remote: string; remotePath?: string } {
   return { remote, remotePath };
 }
 
-function parseSshPort(raw: string | undefined): number {
-  const value = (raw ?? "22").trim();
+function parseSshPort(raw: string | undefined): number | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+
+  const value = raw.trim();
   const parsed = Number.parseInt(value, 10);
   if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
     throw new Error(`Invalid SSH port: ${value}`);
@@ -169,17 +173,22 @@ function parseSshPort(raw: string | undefined): number {
   return parsed;
 }
 
-function buildSshBaseArgs(port: number): string[] {
-  return [
-    "-p",
-    String(port),
+function buildSshBaseArgs(port?: number): string[] {
+  const args: string[] = [];
+  if (port !== undefined) {
+    args.push("-p", String(port));
+  }
+
+  args.push(
     "-o",
     "ControlMaster=auto",
     "-o",
     "ControlPersist=600",
     "-o",
     "ControlPath=/tmp/pi-ssh-%C",
-  ];
+  );
+
+  return args;
 }
 
 function buildResolveRemotePathCommand(remotePath: string): string {
@@ -194,7 +203,7 @@ function buildResolveRemotePathCommand(remotePath: string): string {
 
 async function sshCapture(
   remote: string,
-  port: number,
+  port: number | undefined,
   remoteCommand: string,
   options: SshCaptureOptions = {},
 ): Promise<{ stdout: Buffer; stderr: Buffer; exitCode: number | null; timedOut: boolean }> {
@@ -251,7 +260,7 @@ async function sshCapture(
   });
 }
 
-async function sshExec(remote: string, port: number, remoteCommand: string, options: SshCaptureOptions = {}): Promise<Buffer> {
+async function sshExec(remote: string, port: number | undefined, remoteCommand: string, options: SshCaptureOptions = {}): Promise<Buffer> {
   const result = await sshCapture(remote, port, remoteCommand, options);
   if (result.timedOut) {
     throw new Error(`SSH command timed out after ${options.timeoutSeconds ?? 0}s`);
@@ -273,6 +282,7 @@ class PersistentRemoteShell {
   private child: ChildProcessWithoutNullStreams | null = null;
   private running: RunningCommand | null = null;
   private disposed = false;
+  private startupPromise: Promise<void> | null = null;
   // Incremental streaming state: tracks how many bytes of the normalized
   // (post-start-marker) output have already been sent via onData.
   private streamedBytes = 0;
@@ -305,39 +315,96 @@ class PersistentRemoteShell {
       throw new Error("Remote shell is disposed");
     }
     if (this.child && !this.child.killed) {
+      if (this.startupPromise) {
+        await this.startupPromise;
+      }
+      return;
+    }
+    if (this.startupPromise) {
+      await this.startupPromise;
       return;
     }
 
-    const child = spawn("ssh", [...buildSshBaseArgs(this.connection.port), "-tt", this.connection.remote], {
-      stdio: ["pipe", "pipe", "pipe"],
+    this.startupPromise = new Promise<void>((resolve, reject) => {
+      const child = spawn("ssh", [...buildSshBaseArgs(this.connection.port), "-tt", this.connection.remote], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+
+      let settled = false;
+      const startupMarker = `__PI_SSH_READY_${Date.now()}_${Math.random().toString(16).slice(2)}__`;
+      const startupStdoutChunks: Buffer[] = [];
+      const startupStderrChunks: Buffer[] = [];
+
+      const finishResolve = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+
+      const finishReject = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
+
+      child.on("error", (error) => {
+        if (!settled) {
+          finishReject(error instanceof Error ? error : new Error(String(error)));
+          return;
+        }
+        if (this.running) {
+          this.running.reject(error instanceof Error ? error : new Error(String(error)));
+          this.cleanupRunning();
+        }
+      });
+
+      child.on("close", () => {
+        if (!settled) {
+          const stderr = Buffer.concat(startupStderrChunks).toString("utf-8").trim();
+          finishReject(new Error(stderr || "SSH shell closed during startup"));
+          return;
+        }
+        if (this.running) {
+          this.running.reject(new Error("SSH shell closed unexpectedly"));
+          this.cleanupRunning();
+        }
+        this.child = null;
+      });
+
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (!settled) {
+          startupStdoutChunks.push(chunk);
+          const text = this.normalize(Buffer.concat(startupStdoutChunks).toString("utf-8"));
+          if (text.includes(`${startupMarker}\n`)) {
+            finishResolve();
+            return;
+          }
+        }
+        this.handleStdout(chunk);
+      });
+
+      child.stderr.on("data", (chunk: Buffer) => {
+        if (!settled) {
+          startupStderrChunks.push(chunk);
+        }
+        this.handleStderr(chunk);
+      });
+
+      this.child = child;
+      this.child.stdin.write(
+        "stty -echo 2>/dev/null || true; unset PROMPT_COMMAND 2>/dev/null || true; PS1=''; PS2=''; PROMPT=''; RPROMPT=''; " +
+          "export PAGER=cat; export GIT_PAGER=cat; export GIT_TERMINAL_PROMPT=0; " +
+          "if [ -n \"${ZSH_VERSION-}\" ]; then precmd_functions=(); preexec_functions=(); chpwd_functions=(); unset zle_bracketed_paste 2>/dev/null || true; fi; " +
+          "if [ -n \"${BASH_VERSION-}\" ]; then bind 'set enable-bracketed-paste off' 2>/dev/null || true; fi; " +
+          `cd -- ${shellQuote(this.connection.remoteCwd)}; printf '${startupMarker}\\n'\n`,
+      );
     });
 
-    child.on("error", (error) => {
-      if (this.running) {
-        this.running.reject(error instanceof Error ? error : new Error(String(error)));
-        this.cleanupRunning();
-      }
-    });
-
-    child.on("close", () => {
-      if (this.running) {
-        this.running.reject(new Error("SSH shell closed unexpectedly"));
-        this.cleanupRunning();
-      }
-      this.child = null;
-    });
-
-    child.stdout.on("data", (chunk: Buffer) => this.handleStdout(chunk));
-    child.stderr.on("data", (chunk: Buffer) => this.handleStderr(chunk));
-
-    this.child = child;
-    this.child.stdin.write(
-      "stty -echo 2>/dev/null || true; unset PROMPT_COMMAND 2>/dev/null || true; PS1=''; PS2=''; PROMPT=''; RPROMPT=''; " +
-        "export PAGER=cat; export GIT_PAGER=cat; export GIT_TERMINAL_PROMPT=0; " +
-        "if [ -n \"${ZSH_VERSION-}\" ]; then precmd_functions=(); preexec_functions=(); chpwd_functions=(); unset zle_bracketed_paste 2>/dev/null || true; fi; " +
-        "if [ -n \"${BASH_VERSION-}\" ]; then bind 'set enable-bracketed-paste off' 2>/dev/null || true; fi\n",
-    );
-    this.child.stdin.write(`cd -- ${shellQuote(this.connection.remoteCwd)}\n`);
+    try {
+      await this.startupPromise;
+    } finally {
+      this.startupPromise = null;
+    }
   }
 
   private handleStdout(chunk: Buffer): void {
@@ -760,7 +827,7 @@ function createRemoteBashOps(transport: RemoteTransport): BashOperations {
   };
 }
 
-async function resolveSshConnection(rawFlag: string, localCwd: string, localHome: string, port: number): Promise<SshConnection> {
+async function resolveSshConnection(rawFlag: string, localCwd: string, localHome: string, port: number | undefined): Promise<SshConnection> {
   const parsed = parseSshFlag(rawFlag);
 
   const remoteHomeBuffer = await sshExec(parsed.remote, port, 'printf "%s" "$HOME"', {
@@ -804,9 +871,8 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     type: "string",
   });
   pi.registerFlag("ssh-port", {
-    description: "SSH port (default: 22)",
+    description: "SSH port override (otherwise SSH config/defaults are used)",
     type: "string",
-    default: "22",
   });
   pi.registerFlag("p", {
     description: "Alias for --ssh-port",
@@ -892,12 +958,13 @@ export default function piSshExtension(pi: ExtensionAPI): void {
       const port = parseSshPort(rawPort);
       connection = await resolveSshConnection(flag, localCwd, localHome, port);
       transport = new SshTransport(connection);
-      const enabledMessage = `pi-ssh enabled: ${connection.remote}:${connection.remoteCwd} (port ${connection.port})`;
+      const portLabel = connection.port ?? "ssh-config/default";
+      const enabledMessage = `pi-ssh enabled: ${connection.remote}:${connection.remoteCwd} (port ${portLabel})`;
       console.log(enabledMessage);
       if (ctx.hasUI) {
         ctx.ui.setStatus(
           "pi-ssh",
-          ctx.ui.theme.fg("accent", `SSH ${connection.remote}:${connection.remoteCwd} (port ${connection.port})`),
+          ctx.ui.theme.fg("accent", `SSH ${connection.remote}:${connection.remoteCwd} (port ${portLabel})`),
         );
         ctx.ui.notify(enabledMessage, "info");
       }
@@ -954,7 +1021,7 @@ export default function piSshExtension(pi: ExtensionAPI): void {
     if (!conn) return;
 
     const localPrefix = `Current working directory: ${localCwd}`;
-    const remotePrefix = `Current working directory: ${conn.remoteCwd} (via SSH ${conn.remote}, port ${conn.port})`;
+    const remotePrefix = `Current working directory: ${conn.remoteCwd} (via SSH ${conn.remote}, port ${conn.port ?? "ssh-config/default"})`;
 
     if (!event.systemPrompt.includes(localPrefix)) return;
     let modified = event.systemPrompt.replace(localPrefix, remotePrefix);
